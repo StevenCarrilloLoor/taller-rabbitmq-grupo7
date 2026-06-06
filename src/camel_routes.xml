@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Rutas equivalentes en Apache Camel DSL (XML).
+  En una implementación Java real, estas rutas se cargarían
+  desde un CamelContext con el componente camel-rabbitmq.
+  
+  Dependencias Maven:
+    camel-spring-boot-starter
+    camel-rabbitmq
+    camel-jackson
+-->
+<routes xmlns="http://camel.apache.org/schema/spring">
+
+  <!-- ============================================================
+       RUTA A: Producción de mensajes (Orders API)
+       Point-to-Point -> billing.queue
+       Publish/Subscribe -> orders.exchange
+       ============================================================ -->
+  <route id="orders-producer-billing">
+    <from uri="timer:billing?delay=1000&amp;repeatCount=1"/>
+    <setBody>
+      <constant>
+        {
+          "messageId": "msg-001",
+          "messageType": "GenerarFactura",
+          "orderId": "ORD-1001",
+          "customerId": "CLI-2001",
+          "total": 59.90
+        }
+      </constant>
+    </setBody>
+    <!-- Validación antes de enviar -->
+    <to uri="direct:validate-command"/>
+    <!-- Point-to-Point: envío a cola específica -->
+    <to uri="rabbitmq://localhost:5672/billing.queue?username=admin&amp;password=admin123&amp;exchangeType=direct&amp;autoDelete=false&amp;durable=true"/>
+    <log message="[PRODUCER] Command Message enviado a billing.queue: ${body}"/>
+  </route>
+
+  <route id="orders-producer-event">
+    <from uri="timer:event?delay=2000&amp;repeatCount=1"/>
+    <setBody>
+      <constant>
+        {
+          "eventId": "evt-001",
+          "eventType": "PedidoCreado",
+          "occurredAt": "2026-06-06T10:30:00Z",
+          "source": "orders-api",
+          "payload": {
+            "orderId": "ORD-1001",
+            "customerId": "CLI-2001",
+            "total": 59.90
+          }
+        }
+      </constant>
+    </setBody>
+    <!-- Publish/Subscribe: fanout exchange distribuye a todos los suscriptores -->
+    <to uri="rabbitmq://localhost:5672/orders.exchange?username=admin&amp;password=admin123&amp;exchangeType=fanout&amp;autoDelete=false&amp;durable=true"/>
+    <log message="[PRODUCER] Event Message publicado en orders.exchange: ${body}"/>
+  </route>
+
+  <!-- ============================================================
+       RUTA B: Billing Service (Point-to-Point consumer)
+       Garantía: UN solo consumidor procesa cada mensaje
+       ============================================================ -->
+  <route id="billing-service">
+    <from uri="rabbitmq://localhost:5672/billing.queue?username=admin&amp;password=admin123&amp;autoAck=false&amp;prefetchCount=1&amp;deadLetterExchange=dlx.exchange&amp;deadLetterRoutingKey=invalid"/>
+    <to uri="direct:validate-command"/>
+    <log message="[BILLING] Procesando factura para orderId=${header.orderId}"/>
+    <!-- Aquí se invocaría el sistema de facturación real -->
+    <setHeader name="processed">
+      <constant>true</constant>
+    </setHeader>
+  </route>
+
+  <!-- ============================================================
+       RUTA C: Notification Service (Publish/Subscribe consumer)
+       ============================================================ -->
+  <route id="notification-service">
+    <from uri="rabbitmq://localhost:5672/notification.queue?username=admin&amp;password=admin123&amp;autoAck=false&amp;prefetchCount=1"/>
+    <to uri="direct:validate-event"/>
+    <log message="[NOTIFICATION] Notificación enviada al cliente ${header.customerId}"/>
+  </route>
+
+  <!-- ============================================================
+       RUTA D: Analytics Service (Publish/Subscribe consumer)
+       ============================================================ -->
+  <route id="analytics-service">
+    <from uri="rabbitmq://localhost:5672/analytics.queue?username=admin&amp;password=admin123&amp;autoAck=false&amp;prefetchCount=1"/>
+    <to uri="direct:validate-event"/>
+    <log message="[ANALYTICS] Evento registrado en BI para orderId=${header.orderId}"/>
+  </route>
+
+  <!-- ============================================================
+       RUTA E: Validación - Command Message (GenerarFactura)
+       Mensajes inválidos -> invalid-message.queue (DLX)
+       ============================================================ -->
+  <route id="validate-command">
+    <from uri="direct:validate-command"/>
+    <unmarshal><json library="Jackson"/></unmarshal>
+    <choice>
+      <when>
+        <!-- Sin orderId -->
+        <simple>${body[orderId]} == null || ${body[orderId]} == ''</simple>
+        <log message="[VALIDATOR] INVÁLIDO: falta orderId"/>
+        <throwException exceptionType="org.apache.camel.ValidationException" message="Falta orderId"/>
+      </when>
+      <when>
+        <!-- Sin customerId -->
+        <simple>${body[customerId]} == null || ${body[customerId]} == ''</simple>
+        <log message="[VALIDATOR] INVÁLIDO: falta customerId"/>
+        <throwException exceptionType="org.apache.camel.ValidationException" message="Falta customerId"/>
+      </when>
+      <when>
+        <!-- total <= 0 -->
+        <simple>${body[total]} &lt;= 0</simple>
+        <log message="[VALIDATOR] INVÁLIDO: total menor o igual a cero"/>
+        <throwException exceptionType="org.apache.camel.ValidationException" message="Total inválido"/>
+      </when>
+      <when>
+        <!-- Sin messageId -->
+        <simple>${body[messageId]} == null</simple>
+        <log message="[VALIDATOR] INVÁLIDO: falta messageId"/>
+        <throwException exceptionType="org.apache.camel.ValidationException" message="Falta messageId"/>
+      </when>
+    </choice>
+    <!-- Manejo de error: enviar a invalid-message.queue (Invalid Message Channel) -->
+    <onException>
+      <exception>org.apache.camel.ValidationException</exception>
+      <handled><constant>true</constant></handled>
+      <to uri="rabbitmq://localhost:5672/invalid-message.queue?username=admin&amp;password=admin123&amp;exchangeType=direct&amp;routingKey=invalid"/>
+      <log message="[ERROR-HANDLER] Mensaje inválido enviado a invalid-message.queue"/>
+    </onException>
+  </route>
+
+  <!-- ============================================================
+       RUTA F: Validación - Event Message (PedidoCreado)
+       ============================================================ -->
+  <route id="validate-event">
+    <from uri="direct:validate-event"/>
+    <unmarshal><json library="Jackson"/></unmarshal>
+    <choice>
+      <when>
+        <simple>${body[eventId]} == null</simple>
+        <log message="[VALIDATOR] INVÁLIDO: falta eventId"/>
+        <throwException exceptionType="org.apache.camel.ValidationException" message="Falta eventId"/>
+      </when>
+      <when>
+        <simple>${body[payload][orderId]} == null</simple>
+        <log message="[VALIDATOR] INVÁLIDO: falta payload.orderId"/>
+        <throwException exceptionType="org.apache.camel.ValidationException" message="Falta payload.orderId"/>
+      </when>
+      <when>
+        <simple>${body[payload][total]} &lt;= 0</simple>
+        <log message="[VALIDATOR] INVÁLIDO: payload.total inválido"/>
+        <throwException exceptionType="org.apache.camel.ValidationException" message="Total inválido en evento"/>
+      </when>
+    </choice>
+    <onException>
+      <exception>org.apache.camel.ValidationException</exception>
+      <handled><constant>true</constant></handled>
+      <to uri="rabbitmq://localhost:5672/invalid-message.queue?username=admin&amp;password=admin123&amp;exchangeType=direct&amp;routingKey=invalid"/>
+      <log message="[ERROR-HANDLER] Evento inválido enviado a invalid-message.queue"/>
+    </onException>
+  </route>
+
+  <!-- ============================================================
+       RUTA G: Error Handler (Dead Letter Consumer)
+       ============================================================ -->
+  <route id="error-handler">
+    <from uri="rabbitmq://localhost:5672/invalid-message.queue?username=admin&amp;password=admin123&amp;autoAck=true"/>
+    <log message="[ERROR-HANDLER] Mensaje inválido/fallido recibido: ${body}"/>
+    <!-- Aquí se podría guardar en BD de auditoría, notificar, etc. -->
+  </route>
+
+</routes>
